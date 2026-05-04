@@ -1,1 +1,6 @@
 finance/
+minute/*.csv
+__pycache__/
+batch1/*
+venv/*
+*.zip

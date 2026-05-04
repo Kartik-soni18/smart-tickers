@@ -1,0 +1,129 @@
+1. Fix the Label Horizon First
+
+Your LABEL_HORIZON is currently undefined in the snippet, but for 30-minute swings with 1-minute data:
+Python
+
+Copy
+LABEL_HORIZON = 30  # 30 minutes ahead
+LABEL_THRESHOLD = 0.003  # 0.3% move to trigger Buy/Sell (adjust based on volatility)
+Test different thresholds on your data — too low = noise, too high = rare signals.
+2. Multi-Stock Setup
+
+Directory structure
+
+plain
+
+Copy
+data/
+  raw/
+    RELIANCE.csv
+    TCS.csv
+    INFY.csv
+    ...
+Load all CSVs, train on combined data
+
+Python
+
+Copy
+def build_multi_stock_datasets(data_dir, resolution="micro", ...):
+    all_train, all_val, all_test = [], [], []
+    for csv_file in sorted(Path(data_dir).glob("*.csv")):
+        train_ds, val_ds, test_ds = build_datasets(csv_file, resolution, ...)
+        all_train.append(train_ds)
+        all_val.append(val_ds)
+        all_test.append(test_ds)
+    
+    return (
+        ConcatDataset(all_train),
+        ConcatDataset(all_val),
+        ConcatDataset(all_test)
+    )
+Why this matters: Training on one stock = memorizing its noise. Multiple stocks force the model to learn generalizable patterns.
+3. Walk-Forward Validation (Critical)
+
+Replace the naive sequential split with rolling windows:
+plain
+
+Copy
+Train:  Jan-Mar  →  Val: Apr  →  Test: May
+Train:  Feb-Apr  →  Val: May  →  Test: Jun
+...
+This mimics real trading — you only train on past data, never future.
+Python
+
+Copy
+def build_walkforward_splits(df, window_days=60, val_days=10, test_days=10):
+    # Split by time, not by row index
+    # Returns list of (train_df, val_df, test_df) tuples
+4. Add Proper Feature Engineering
+
+Your model only sees close prices. Add channels for:
+Table
+
+
+Feature	Why
+Returns (log or pct)	Stationarity
+Volume	Confirms price moves
+RSI / MACD / Bollinger	Momentum/mean-reversion signals
+ATR (volatility)	Position sizing, regime detection
+Encode as additional channels or replace one of GASF/GADF/MTF if compute is tight.
+5. Fix the Data Leakage Risk
+
+In MarketFingerprintDataset.__getitem__:
+Python
+
+Copy
+window = zscore(self.close[start : start + self.window])
+Problem: zscore computes mean/std over the window itself. In live trading, you don't know the future mean/std of the next 60 bars. Use a rolling z-score from a lookback before start:
+Python
+
+Copy
+lookback = self.close[start - 200 : start]  # past 200 mins
+mean, std = lookback.mean(), lookback.std()
+window = (self.close[start : start + self.window] - mean) / (std + 1e-8)
+window = np.clip(window, -3, 3)
+6. Improve the MTF Fallback
+
+Replace the broken constant-series fallback:
+Python
+
+Copy
+if actual_k < 1:
+    return np.eye(n, dtype=np.float64)  # deterministic self-loop
+7. Add Regime Detection
+
+A model trained in bull markets fails in bear markets. Add a regime label:
+Use ADX, VIX proxy, or rolling volatility
+Train separate models per regime, or condition the network
+8. Production Inference Pipeline
+
+Python
+
+Copy
+class LiveTrader:
+    def __init__(self, model_path, symbol, window=60):
+        self.model = load_model(model_path)
+        self.buffer = deque(maxlen=window + 200)  # lookback + window
+    
+    def on_tick(self, price, volume):
+        self.buffer.append((price, volume))
+        if len(self.buffer) >= self.window + 200:
+            features = self._prepare(self.buffer)
+            prob = self.model(features, return_logits=False)
+            return self._act(prob)  # Buy/Sell/Hold with confidence threshold
+    
+    def _act(self, prob, confidence=0.6):
+        if prob.max() > confidence:
+            return prob.argmax()  # 0=Sell, 1=Hold, 2=Buy
+        return 1  # Hold
+9. Backtesting Framework
+
+Don't trust validation accuracy. Simulate actual trades:
+Python
+
+Copy
+def backtest(model, test_df, threshold=0.6, commission=0.001):
+    # Walk through test set chronologically
+    # Enter on Buy (prob > threshold), exit on Sell signal or stop-loss
+    # Track P&L, drawdown, Sharpe ratio, win rate
+Metrics that matter: Sharpe, max drawdown, profit factor — not accuracy. A model can be 55% accurate but lose money if losses are larger than wins.
