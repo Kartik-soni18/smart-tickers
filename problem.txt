@@ -1,129 +1,150 @@
-1. Fix the Label Horizon First
+1.
+Download the best model after every 500 iterations from collab to mac option
 
-Your LABEL_HORIZON is currently undefined in the snippet, but for 30-minute swings with 1-minute data:
+2. Mixed Precision (2× Speedup on T4)
+
+Add after device setup:
 Python
 
 Copy
-LABEL_HORIZON = 30  # 30 minutes ahead
-LABEL_THRESHOLD = 0.003  # 0.3% move to trigger Buy/Sell (adjust based on volatility)
-Test different thresholds on your data — too low = noise, too high = rare signals.
-2. Multi-Stock Setup
+from torch.cuda.amp import autocast, GradScaler
 
-Directory structure
-
-plain
-
-Copy
-data/
-  raw/
-    RELIANCE.csv
-    TCS.csv
-    INFY.csv
-    ...
-Load all CSVs, train on combined data
-
+scaler = GradScaler()  # Add this once, before training loop
+Replace your train_epoch() function with this:
 Python
 
 Copy
-def build_multi_stock_datasets(data_dir, resolution="micro", ...):
-    all_train, all_val, all_test = [], [], []
-    for csv_file in sorted(Path(data_dir).glob("*.csv")):
-        train_ds, val_ds, test_ds = build_datasets(csv_file, resolution, ...)
-        all_train.append(train_ds)
-        all_val.append(val_ds)
-        all_test.append(test_ds)
+def train_epoch(model, loader, criterion, optimizer, device, epoch, total_epochs):
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
     
-    return (
-        ConcatDataset(all_train),
-        ConcatDataset(all_val),
-        ConcatDataset(all_test)
-    )
-Why this matters: Training on one stock = memorizing its noise. Multiple stocks force the model to learn generalizable patterns.
-3. Walk-Forward Validation (Critical)
-
-Replace the naive sequential split with rolling windows:
-plain
-
-Copy
-Train:  Jan-Mar  →  Val: Apr  →  Test: May
-Train:  Feb-Apr  →  Val: May  →  Test: Jun
-...
-This mimics real trading — you only train on past data, never future.
-Python
-
-Copy
-def build_walkforward_splits(df, window_days=60, val_days=10, test_days=10):
-    # Split by time, not by row index
-    # Returns list of (train_df, val_df, test_df) tuples
-4. Add Proper Feature Engineering
-
-Your model only sees close prices. Add channels for:
-Table
-
-
-Feature	Why
-Returns (log or pct)	Stationarity
-Volume	Confirms price moves
-RSI / MACD / Bollinger	Momentum/mean-reversion signals
-ATR (volatility)	Position sizing, regime detection
-Encode as additional channels or replace one of GASF/GADF/MTF if compute is tight.
-5. Fix the Data Leakage Risk
-
-In MarketFingerprintDataset.__getitem__:
-Python
-
-Copy
-window = zscore(self.close[start : start + self.window])
-Problem: zscore computes mean/std over the window itself. In live trading, you don't know the future mean/std of the next 60 bars. Use a rolling z-score from a lookback before start:
-Python
-
-Copy
-lookback = self.close[start - 200 : start]  # past 200 mins
-mean, std = lookback.mean(), lookback.std()
-window = (self.close[start : start + self.window] - mean) / (std + 1e-8)
-window = np.clip(window, -3, 3)
-6. Improve the MTF Fallback
-
-Replace the broken constant-series fallback:
-Python
-
-Copy
-if actual_k < 1:
-    return np.eye(n, dtype=np.float64)  # deterministic self-loop
-7. Add Regime Detection
-
-A model trained in bull markets fails in bear markets. Add a regime label:
-Use ADX, VIX proxy, or rolling volatility
-Train separate models per regime, or condition the network
-8. Production Inference Pipeline
-
-Python
-
-Copy
-class LiveTrader:
-    def __init__(self, model_path, symbol, window=60):
-        self.model = load_model(model_path)
-        self.buffer = deque(maxlen=window + 200)  # lookback + window
+    for step, (inputs, targets) in enumerate(loader, 1):
+        inputs, targets = inputs.to(device), targets.to(device)
+        
+        optimizer.zero_grad()
+        
+        # Mixed precision forward
+        with autocast():
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+        
+        # Scaled backward
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
+        # Stats (unscale for accurate logging)
+        total_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
+        
+        if step % 100 == 0:
+            print(f"  Epoch {epoch}/{total_epochs} | step {step}/{len(loader)} | "
+                  f"loss {total_loss/step:.4f} | acc {correct/total:.4f}")
     
-    def on_tick(self, price, volume):
-        self.buffer.append((price, volume))
-        if len(self.buffer) >= self.window + 200:
-            features = self._prepare(self.buffer)
-            prob = self.model(features, return_logits=False)
-            return self._act(prob)  # Buy/Sell/Hold with confidence threshold
-    
-    def _act(self, prob, confidence=0.6):
-        if prob.max() > confidence:
-            return prob.argmax()  # 0=Sell, 1=Hold, 2=Buy
-        return 1  # Hold
-9. Backtesting Framework
+    return total_loss / len(loader), correct / total
+3. Early Stopping + LR Scheduler
 
-Don't trust validation accuracy. Simulate actual trades:
+Replace your training loop with this:
 Python
 
 Copy
-def backtest(model, test_df, threshold=0.6, commission=0.001):
-    # Walk through test set chronologically
-    # Enter on Buy (prob > threshold), exit on Sell signal or stop-loss
-    # Track P&L, drawdown, Sharpe ratio, win rate
-Metrics that matter: Sharpe, max drawdown, profit factor — not accuracy. A model can be 55% accurate but lose money if losses are larger than wins.
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+# After optimizer setup
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1, verbose=True)
+
+best_val_loss = float("inf")
+patience = 2
+patience_counter = 0
+
+for epoch in range(1, EPOCHS + 1):
+    t_loss, t_acc = train_epoch(model, train_loader, criterion, optimizer, device, epoch, EPOCHS)
+    v_loss, v_acc, _, _ = evaluate(model, val_loader, criterion, device)
+    
+    # Step scheduler
+    scheduler.step(v_loss)
+    
+    print(f"\nEpoch {epoch} | train_loss: {t_loss:.4f} | val_loss: {v_loss:.4f} | val_acc: {v_acc:.4f}")
+    
+    # Save every epoch (backup)
+    torch.save(model.state_dict(), BACKUP_CHECKPOINT.format(epoch=epoch))
+    
+    # Early stopping check
+    if v_loss < best_val_loss:
+        best_val_loss = v_loss
+        torch.save(model.state_dict(), CHECKPOINT)
+        print(f"  ✔ New best model saved (val_loss: {v_loss:.4f})")
+        patience_counter = 0
+    else:
+        patience_counter += 1
+        print(f"  ⚠ No improvement ({patience_counter}/{patience})")
+        if patience_counter >= patience:
+            print(f"  🛑 Early stopping at epoch {epoch}")
+            break
+
+print(f"\nLoading best model from {CHECKPOINT}")
+model.load_state_dict(torch.load(CHECKPOINT, map_location=device))
+4. Reduce Epochs + Adjust Config
+
+Python
+
+Copy
+EPOCHS = 3          # Was 5 — early stopping will likely hit at 2-3
+BATCH_SIZE = 256    # Keep (T4 handles this)
+WORKERS = 2         # Keep, but persistent_workers only if WORKERS > 0
+5. Check Class Distribution (Critical)
+
+Add before training starts:
+Python
+
+Copy
+from collections import Counter
+import numpy as np
+
+# Check if your dataset exposes targets
+if hasattr(train_ds, 'targets'):
+    dist = Counter(train_ds.targets)
+elif hasattr(train_ds, 'labels'):
+    dist = Counter(train_ds.labels)
+else:
+    # Extract from DataLoader
+    all_labels = []
+    for _, labels in train_loader:
+        all_labels.extend(labels.numpy())
+    dist = Counter(all_labels)
+
+total = sum(dist.values())
+print("\n=== CLASS DISTRIBUTION ===")
+for cls, count in sorted(dist.items()):
+    pct = 100 * count / total
+    name = ["Sell", "Hold", "Buy"][cls] if cls < 3 else str(cls)
+    print(f"  {name}: {count:,} ({pct:.1f}%)")
+
+if max(dist.values()) / total > 0.7:
+    print("⚠️ WARNING: Severe class imbalance detected!")
+    print("   Accuracy will be misleading. Use F1-macro or balanced accuracy.")
+6. Better Evaluation Metrics
+
+Replace your final evaluation with:
+Python
+
+Copy
+from sklearn.metrics import classification_report, f1_score, balanced_accuracy_score, confusion_matrix
+
+_, t_acc, preds, labels = evaluate(model, test_loader, criterion, device)
+
+print(f"\n=== FINAL TEST RESULTS ===")
+print(f"Raw Accuracy:      {t_acc:.4f}")
+print(f"Balanced Accuracy: {balanced_accuracy_score(labels, preds):.4f}")
+print(f"F1-Macro:          {f1_score(labels, preds, average='macro'):.4f}")
+print(f"F1-Weighted:       {f1_score(labels, preds, average='weighted'):.4f}")
+
+print("\nPer-Class F1:")
+print(classification_report(labels, preds, target_names=["Sell", "Hold", "Buy"]))
+
+print("\nConfusion Matrix:")
+print(confusion_matrix(labels, preds))
